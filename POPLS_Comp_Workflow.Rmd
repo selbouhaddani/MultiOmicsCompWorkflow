@@ -1,0 +1,433 @@
+---
+title: "POPLS-DA Computational Workflow for vertical multi-omics data"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+# MSA analysis {.tabset .tabset-fade .tabset-pills}
+
+## Background 
+
+These packages are needed for all functionalities
+
+```{r Libraries}
+## CRAN or BioConductor packages
+library("BiocManager")
+library(devtools)
+library(OmicsPLS)
+library(mixOmics)
+library(preprocessCore)
+library(edgeR)
+library(ropls)
+library("org.Hs.eg.db")
+library("GO.db")
+library(tidyverse)
+library(magrittr)
+library(ggrepel)
+library("gridExtra")
+library("STRINGdb")
+library("RColorBrewer")
+library("rvest")
+library(cluster)
+#library("dbparser")
+library("plotly")
+library("kableExtra")
+
+## GitHub packages
+# library(PO2PLS) # devtools::install_github("selbouhaddani/PO2PLS")
+library(disgenet2r) # devtools::install_bitbucket("ibi_group/disgenet2r")
+library("dbdataset") # devtools::install_github("interstellar-Consultation-Services/dbdataset")
+
+## The POPLS-DA Code
+source("https://raw.githubusercontent.com/selbouhaddani/POPLSDA/main/POPLS2.R")
+
+```
+
+## Pre-processing multi-omics
+
+First, simulate some artificial multi-omics data. 
+
+```{r Simulate data}
+########## Pre-processing multi-omics data #####
+## Define the datasets
+## Note, this is designed for data on different samples
+# Dataset in format all Omics Samples x Genes
+N_samples <- 50
+p_genes <- 2000
+Data_MultiOmics <- matrix(rnorm(N_samples*p_genes), nrow=N_samples, ncol=p_genes)
+rownames(Data_MultiOmics) <- 1:nrow(Data_MultiOmics)
+# Add colnames of the data are the gene names
+colnames(Data_MultiOmics) <- org.Hs.eg.db %>% 
+  AnnotationDbi::select(keys=keys(org.Hs.eg.db)[1:p_genes], 
+                        columns = "SYMBOL") %>% pull("SYMBOL")
+# Define the outcome/experimental groups for all samples
+Data_outcome <- rbinom(nrow(Data_MultiOmics), 1, prob = 0.5)
+# Define the type of omics data for each sample
+Data_OmicsLevels <- factor(sort(rep(1:2, length.out = nrow(Data_MultiOmics))), 
+                           labels = c("Omics_1","Omics_2"))
+Data_OmicsLvls <- as.numeric(Data_OmicsLevels)
+```
+
+Pre-process these data.
+
+```{r Pre-process}
+## Scale
+for(ii in 1:length(levels(Data_OmicsLevels))){
+  Data_MultiOmics[which(Data_OmicsLvls == ii),] %<>% scale
+}
+
+## Reference association profile
+ref_test <- 
+  sapply(1:ncol(Data_MultiOmics), 
+     function(ii) {
+       coef(summary(lm(
+         Data_MultiOmics[which(Data_OmicsLvls == 1),ii] ~ 
+           Data_outcome[which(Data_OmicsLvls==1)])))[2,3] %>% sign
+     })
+
+## Align for other omics their association profile
+for(lvl_i in 2:length(levels(Data_OmicsLevels))){
+  lvl_test <- 
+    sapply(1:ncol(Data_MultiOmics), 
+           function(ii) {
+             coef(summary(lm(
+               Data_MultiOmics[which(Data_OmicsLvls == lvl_i),ii] ~ 
+                 Data_outcome[which(Data_OmicsLvls == lvl_i)])))[2,3] %>% sign
+           })
+  Data_MultiOmics[Data_OmicsLvls==lvl_i,] %<>% 
+    sweep(2, ref_test*lvl_test,`*`)
+}
+
+```
+
+
+## POPLS-DA data integration
+
+First, choose the number of components (e.g. via a scree-plot).
+```{r Choose nr components}
+########## POPLS-DA integrative model  ##### 
+# Scree plot and Gap Statistic
+plot(svd(Data_MultiOmics,nu=0,nv=0)$d^2 / sum(svd(Data_MultiOmics,nu=0,nv=0)$d^2))
+# Initial fit for object structure
+fit_splsda <- splsda(X = Data_MultiOmics, Y = Data_outcome, ncomp = 2)
+#Prepare POPLS-DA as a list with individual omics datasets
+Data_POPLS <- 
+  lapply(unique(Data_OmicsLvls),
+         function(ii) list(X=Data_MultiOmics[Data_OmicsLvls==ii,], 
+                           Y=Data_outcome[Data_OmicsLvls==ii]))
+p_genes #nr of genes
+K <- length(unique(Data_OmicsLvls)) #nr of omics levels
+r <- 2 #nr of joint components
+rx <- 1 #nr of specific components 
+
+```
+
+Prepare and fit the POPLS-DA model to the data.
+
+```{r Fit POPLS-DA}
+# Source PO2PLS functions if R package doesnt't work
+source("https://raw.githubusercontent.com/selbouhaddani/PO2PLS/master/R/PO2PLS_functions.R")
+source("https://raw.githubusercontent.com/selbouhaddani/PO2PLS/master/R/PO2PLS_output.R")
+# Generate inital parameters, partly based on initial fit
+prm.tst <- with(generate_params(ncol(Data_MultiOmics), 10, r, K*rx, 0, type = "r"), list(
+  W = fit_splsda$loadings$X,
+  P = lapply(1:K, function(K_ii) matrix(rnorm(ncol(Data_MultiOmics)*rx),ncol=rx)),
+  beta = diag(B),
+  SigT = SigT,
+  SigU = SigTo[1:rx, 1:rx],
+  sig2e = as.list(rep(sig2E, length(unique(Data_OmicsLvls)))),
+  sig2eps = as.list(rep(SigH[1], length(unique(Data_OmicsLvls))))#,
+  #Pen = list(lambda = 0, Target_W = fit_splsda$loadings$X)
+))
+prm.tst$W %<>% as.matrix %>% multiply_by_matrix(sqrt(prm.tst$SigT))
+prm.tst$SigT <- diag(1, r)
+prm.cur <- prm.tst#[1:8]
+
+# Fit POPLS-DA
+fit_poplsda <- POPLS.EM(Data_POPLS, prm.cur, nsteps = 1e3, atol=1e-7)
+
+```
+
+Plot and inspect the results in terms of top genes and prediction performance. 
+
+```{r Visualize results}
+# Rank genes according to effect size
+topGenes <- (fit_poplsda$par$W%*%fit_poplsda$par$beta)[,1] %>% abs %>% sort(decreasing=T) %>% tibble(weight=.,SYMBOL=names(.))
+
+## Output of fit
+# Plot of samples per component
+tibble(T1 = orth(Data_MultiOmics %*% fit_poplsda$param$W[,1]),
+       T2 = orth(Data_MultiOmics %*% fit_poplsda$param$W[,2]),
+       Group = factor(Data_outcome,labels = c("Case","Control")),
+       Omics = Data_OmicsLevels) %>%
+  ggplot(aes(x=T1, y=T2)) +
+  geom_point(aes(col=Group, shape = Omics), size=3) +
+  scale_color_manual(values = c("#E69314", "#0C7BDC")) +
+  stat_ellipse(aes(x=T1, y=T2, col=Group), level = 0.9, size=1.2) +
+  theme_bw() + theme(text = element_text(size=16)) +
+  xlab("Joint scores 1") + ylab("Joint scores 2")
+  
+# Explained variances by joint parts
+sapply(levels(Data_OmicsLevels), function(ee){
+  ii <- which(levels(Data_OmicsLevels) == ee)
+  R2_toti <- with(fit_poplsda$param, 
+                  tr(crossprod(W))+tr(crossprod(P[[ii]]))+ncol(Data_MultiOmics)*sig2e[[ii]])
+  with(fit_poplsda$param, (tr(crossprod(W))+tr(crossprod(P[[ii]])))/R2_toti)
+}, USE.NAMES = TRUE)
+
+# Select the number of relevant genes with a scree plot
+eff_sze <- with(fit_poplsda$par, W %*% beta)
+eff_sze.srt <- orth(eff_sze[order(-eff_sze^2)])
+tibble(nrGns = seq_along(eff_sze), VarExpl=eff_sze.srt^2) %>%
+  qplot(x=nrGns, y=VarExpl, data = ., geom="point",
+        xlab = "Genes", ylab="Individual variance explained")
+top_K <- 200
+
+# After selection, use these genes to predict the outcome
+Wbeta_subset <- fit_poplsda$par$W %*% fit_poplsda$par$beta
+Wbeta_subset[-order(-Wbeta_subset^2)[1:top_K]] = 0
+tibble(Predictions = scale(Data_MultiOmics %*% Wbeta_subset),
+       Group = factor(Data_outcome,labels = c("Case","Control")),
+       Omics = Data_OmicsLevels) %>%
+  ggplot(aes(x=Group, y=Predictions)) +
+  geom_boxplot() +
+  geom_jitter(aes(col=Omics), width = 0.2, height = 0, size = 3) +
+  theme_bw() + theme(text = element_text(size=20)) +
+  scale_color_manual(values = c("#E69314", "#0C7BDC"))
+
+```
+
+
+## Direct Neighbor approach
+
+First, find the drug targets of the given drugs.
+
+```{r}
+## Find drug targets of given drugs
+refDrugs <- c("Dexibuprofen", "Imatinib") # example drugs
+refGenes <- sapply(refDrugs, function(e) {
+  cat("\n Looking up ",e,"... \n", sep="")
+  DBDrug <- dbdataset::drugbank$drugs$general_information %>% filter(name == e)
+  if(nrow(DBDrug) > 0){
+    DBhtml <- read_html(paste0("https://www.drugbank.ca/drugs/",DBDrug$primary_key))
+    DBtext <- DBhtml %>% html_nodes(css='div.col-sm-12.col-lg-7') %>% html_text
+    DBgene.loc <- DBtext %>% lapply(function(ee) ee %>% str_locate(c("Uniprot ", "Gene Name")) %>% diag %>% `[`(c(2,1)))
+    if(length(DBgene.loc)>0) {
+      DBgene <- sapply(1:length(DBgene.loc), function(ii) DBtext[ii] %>% str_sub(DBgene.loc[[ii]][1]+1, DBgene.loc[[ii]][2]-1))
+      cat("  \U2714 -- Gene(s) found: ***", DBgene, "***"); return(DBgene)}
+    else {cat("  \U274C -- Drug found, but gene NOT FOUND"); return(NA)}
+  } else {cat("  \U274C -- DRUG NOT FOUND"); return(NA)}
+}) %>% na.omit %>% c
+cat("\n")
+if(anyNA(refGenes)) refGenes <- refGenes[-which(is.na(refGenes))]
+
+```
+
+Initialize a String-DB connection to find interacting neighbors.
+
+```{r}
+# Initialize a string-db connection, needs internet
+if(!exists("string_db")) string_db <- STRINGdb$new( version="11.5", species=9606, score_threshold=400, input_directory="")
+# Map top Genes to string identifiers, takes some time
+dat.mapped <- string_db$map(as.data.frame(topGenes[1:top_K,]), "SYMBOL", removeUnmappedRows = FALSE )
+if(anyDuplicated(dat.mapped$SYMBOL) > 0) dat.mapped %<>% filter(!(duplicated(SYMBOL)))
+# Calculate all neighbors of the top genes, takes some time
+# Rerun when connection time out
+tophits <- dat.mapped %>% pull(STRING_id)
+tophits.nb <- c(string_db$get_neighbors(tophits), tophits) %>% unique
+dat.top <- dat.mapped 
+
+```
+
+Now, calculate the direct neighbors of each gene/drug. 
+
+```{r Find DNs}
+## Direct Neighbor approach
+# Integrate drug targets into top genes from POPLS-DA
+# Identify overlap between top genes (+neighbors) and drug targets
+tophits_nball <- lapply(seq_along(refGenes), function(ii) {
+  refdrug <- dbdataset::drugbank$drugs$general_information %>% filter(primary_key == names(refGenes[ii])) %>% pull("name")
+  print(paste0(ii, "/",length(refGenes),"  ", refdrug))
+  refgene <- na.omit(refGenes[[ii]])
+  PDE1 <- string_db$mp(refgene)
+  PDE1.nb <- string_db$get_neighbors(PDE1)
+  print(paste0("Nr of interactors:", length(tophits.nb %>% intersect(PDE1.nb))))
+  tophits.pde1 <- tophits %>% intersect(PDE1.nb) %>% c(PDE1)
+  return(dat.top %>% filter(STRING_id %in% tophits.pde1) %>% pull(SYMBOL))
+})
+refGenes_names <- names(refGenes)
+names(tophits_nball) <- refGenes_names
+# Create a gene x drug table with an indicator (0/1) of a Direct Neighbor
+gene_drug_tbl <- sapply(tophits_nball, function(e) dat.top$SYMBOL %in% e) %>% 
+  as_tibble %>% `+`(0)
+gene_drug_tbl %<>% bind_cols(SYMBOL = dat.top$SYMBOL, .) %>% as_tibble
+
+```
+
+Print the drug by DN (direct neighbors) table, as well as in LaTeX code.
+
+```{r}
+# Print the table in LaTeX table format
+tmp <- gene_drug_tbl %>% select(-1) %>% apply(2, sum) %>% sort(decreasing = T)
+tmp <- data.frame(Rank = 1:length(tmp), Drugs = names(tmp), DNs = tmp)
+tmp %>% as_tibble %>% kbl %>% 
+  kable_paper("hover") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),fixed_thead = T) %>% 
+  scroll_box(width = "80%", height = "500px")
+lapply(1:nrow(tmp), function(ii){
+  cat(unlist(tmp[ii,]), sep=" & ")
+  cat(" \\\\ \n")
+}) %>% invisible
+
+```
+
+Print the gene by drug table, as well as in LaTeX code.
+
+```{r}
+# Arrange the table sorted by number of DNs per gene
+gene_drug_tbl %>% mutate(NrDrugs = rowSums(gene_drug_tbl[,-1])) %>% select(1,NrDrugs) %>% 
+  arrange(-NrDrugs) %>% kbl %>% 
+  kable_paper("hover") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),fixed_thead = T) %>% 
+  scroll_box(width = "80%", height = "500px")
+
+# Arrange and print the targeting drugs per gene in LaTeX format
+GenexDrug <- lapply(1:nrow(gene_drug_tbl), function(e){
+  tibble(SYMBOL = gene_drug_tbl$SYMBOL[e], 
+         DRUGS = str_flatten(colnames(gene_drug_tbl[,-1])[which(gene_drug_tbl[e,-1] == 1)], collapse = "; "))
+}) %>% Reduce(f=bind_rows)
+apply(GenexDrug, 1, function(e) {cat(e, sep=" & "); cat("\\\\"); cat("\n")})
+
+```
+
+
+## Integrated Interaction Network
+
+First, map the number of DNs to a color profile.  
+```{r}
+# Generate colors based on nr of targets
+FDAcolr <- colorRampPalette(c("white","green"))
+plotCol <- sapply(1:nrow(gene_drug_tbl), function(ii) {
+  FDAcol = sum(gene_drug_tbl[ii,-1])
+  out <- NA
+  if(FDAcol > 0) out = FDAcolr(max(rowSums(gene_drug_tbl[,-1]))+1)[FDAcol+1]
+  out
+})
+dat.top$color <- plotCol
+# payload_id <- string_db$post_payload(tophits, colors=dat.top$color[1:top_K])
+# string_db$plot_network(tophits, payload_id=payload_id)
+
+tophits.conn <- string_db$get_interactions(tophits)[1:2] %>% 
+  Reduce(f = c) %>% unique
+#par(mar=c(.1,.1,.1,.1))
+#string_db$plot_network(tophits.conn, add_link = F, add_summary = F)
+#par(mar = .pardefault$mar)
+```
+
+Print output format for use as payload on the String-DB website.
+
+```{r}
+######## List for payload ######
+sweblist <- cbind(tophits, dat.top$color, "-")[1:top_K,]
+sweblist <- cbind(sweblist, 
+                  mapIds(org.Hs.eg.db, as.character(dat.top$SYMBOL), 
+                         "UNIPROT", "SYMBOL", multiVals="first"))
+if(anyNA(sweblist[,1])) sweblist <- sweblist[!is.na(sweblist[,1]),]
+sweblist[which(is.na(sweblist[,2])),2] <- "#F7F6F2"
+#sweblist[,4] <- paste0("https://www.uniprot.org/uniprot/", sweblist[,4])
+sweblist <- cbind(sweblist, "-")
+invisible(apply(sweblist,1,function(e) {cat(e,sep='\t'); cat('\n')}))
+
+```
+
+
+
+## Functional enrichment of relevant genes
+
+First, the necessary preliminary functions are defined.
+```{r}
+########## Functional enrichment analyses  ##### 
+## Function to map IDs to Symbols 
+ID2Symb <- function(e, from = "ENTREZID", to = "SYMBOL"){
+  AnnotationDbi::select(org.Hs.eg.db, e, keytype = from, columns = to) %>% 
+    pull(to)
+}
+
+# This custom goana function is needed 
+source("goana_default.R")
+
+```
+
+Perform a GO, KEGG and DisGeNet enrichment analysis and print the gene by term tables.
+
+```{r}
+topEntrez <- topGenes[1:top_K, ]$SYMBOL %>% 
+  ID2Symb(from = "SYMBOL", to = "ENTREZID")
+
+topEntrez %>% goana.default -> GOtbl
+
+GOtbl$tbl[,-1] %>% topGO %>% kbl %>%
+  kable_paper("hover") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "500px")
+
+topEntrez %>% kegga -> KGtbl
+
+KGtbl %>% topKEGG %>% kbl %>%
+  kable_paper("hover") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "500px")
+
+GOtbl.top <- GOtbl$tbl[,-1] %>% topGO
+GOtbl.top <- inner_join(GOtbl.top, GOtbl$tbl)
+names(GOtbl$gns)[2] <- "GOID"
+
+GOtbl.gns <- GOtbl$gns %>% filter(gene_id %in% (topEntrez))
+GOtbl.top2 <- inner_join(GOtbl.top, GOtbl$gns[,1:2])
+GOtbl.mrx <- sapply(simplify = F, 
+                    GOtbl.top2$GOID %>% unique, 
+                    function(e) GOtbl.top2 %>% filter(GOID==e) %>% pull(gene_id) %>% ID2Symb)
+gns_all <- GOtbl.mrx %>% unlist %>% unique
+GOtbl.mrx2 <- sapply(names(GOtbl.mrx), function(e) {
+  gns <- GOtbl.mrx[[e]]
+  gns_all %in% gns
+})
+
+GOtbl.mrx2 %<>% bind_cols(SYMBOL=gns_all) %>% dplyr::inner_join(topGenes[1:top_K,"SYMBOL"],.) %>%
+  mutate(SYMBOL=factor(SYMBOL,levels=SYMBOL,labels=SYMBOL))
+GOtbl.mrx2 %<>% bind_cols(Rank = 1:nrow(.), .)
+
+GOtbl.plot <- GOtbl.mrx2 %>% as_tibble %>%
+  bind_cols(colr=rep(c("#E69314", "#0C7BDC"),length.out=nrow(GOtbl.mrx2))) %>% pivot_longer(contains("GO:"))
+GOtbl.plot %<>% mutate(name=factor(name, name, name))
+GOtbl.plot %<>% mutate(colr = ifelse(value, colr, "white"),
+                       Term = AnnotationDbi::select(GO.db,
+                                                    keys=as.character(name), keytype="GOID", columns="TERM")[[2]],
+                       GName = AnnotationDbi::select(org.Hs.eg.db,
+                                                     keys=as.character(SYMBOL), keytype="SYMBOL", columns="GENENAME")[[2]])
+names(GOtbl.plot) <- c("Rank","GeneSymbol", "colr", "GOid", "value","GOterm","GeneName")
+GOtbl.plot$GeneSymbol %<>% fct_rev
+p <- GOtbl.plot %>% ggplot(aes(x=GOid, y=GeneSymbol,
+                               GENElabel=GeneName,GOlabel=GOterm,Rank=Rank)) +
+  geom_point(size=GOtbl.plot$value*3, col=GOtbl.plot$colr) +
+  theme_bw() + scale_x_discrete(position = "top") + theme(axis.text.x = element_text(angle=45)) +
+  xlab("GO ID") + ylab("Top Genes")
+p %>% ggplotly(tooltip = c("Rank","GeneSymbol","GENElabel","GOlabel"), height=3000) %>%
+  layout(xaxis = list(side ="top" ) )
+
+
+## DisGeNet analysis
+tophits.disgenet <- 
+  disease_enrichment(entities = topGenes$SYMBOL[1:top_K],database = "BEFREE" )
+tophits.disgenet@qresult[1:20, c("Description", "FDR", "Ratio",  "BgRatio")]
+
+```
+
