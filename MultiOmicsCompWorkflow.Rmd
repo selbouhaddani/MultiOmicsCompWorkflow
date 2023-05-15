@@ -4,15 +4,15 @@ output:
   html_document:
     toc: yes
     df_print: paged
-  html_notebook:
-    number_sections: yes
+#  html_notebook:
+#    number_sections: yes
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
 ```
 
-# MSA analysis {.tabset .tabset-fade .tabset-pills}
+# POPLS-DA Computational Workflow {.tabset .tabset-fade .tabset-pills}
 
 ## Background 
 
@@ -21,30 +21,33 @@ These packages are needed for all functionalities
 ```{r Libraries}
 ## CRAN or BioConductor packages
 library("BiocManager")
-library(devtools)
-library(OmicsPLS)
-library(mixOmics)
-library(preprocessCore)
-library(edgeR)
-library(ropls)
+library("devtools")
+library("OmicsPLS")
+library("mixOmics")
+library("preprocessCore")
+library("edgeR")
+library("ropls")
 library("org.Hs.eg.db")
 library("GO.db")
-library(tidyverse)
-library(magrittr)
-library(ggrepel)
+library("tidyverse")
+library("magrittr")
+library("ggrepel")
 library("gridExtra")
 library("STRINGdb")
 library("RColorBrewer")
 library("rvest")
-library(cluster)
-#library("dbparser")
+library("cluster")
 library("plotly")
 library("kableExtra")
+#library("dbparser")
 
 ## GitHub packages
-# library(PO2PLS) # devtools::install_github("selbouhaddani/PO2PLS")
+library(PO2PLS) # devtools::install_github("selbouhaddani/PO2PLS")
 library(disgenet2r) # devtools::install_bitbucket("ibi_group/disgenet2r")
 library("dbdataset") # devtools::install_github("interstellar-Consultation-Services/dbdataset")
+
+# This custom goana function is needed 
+source("goana_default.R")
 
 ## The POPLS-DA Code
 source("https://raw.githubusercontent.com/selbouhaddani/POPLSDA/main/POPLS2.R")
@@ -133,9 +136,6 @@ rx <- 1 #nr of specific components
 Prepare and fit the POPLS-DA model to the data.
 
 ```{r Fit POPLS-DA}
-# Source PO2PLS functions if R package doesnt't work
-source("https://raw.githubusercontent.com/selbouhaddani/PO2PLS/master/R/PO2PLS_functions.R")
-source("https://raw.githubusercontent.com/selbouhaddani/PO2PLS/master/R/PO2PLS_output.R")
 # Generate inital parameters, partly based on initial fit
 prm.tst <- with(generate_params(ncol(Data_MultiOmics), 10, r, K*rx, 0, type = "r"), list(
   W = fit_splsda$loadings$X,
@@ -374,7 +374,7 @@ topEntrez <- topGenes[1:top_K, ]$SYMBOL %>%
 
 topEntrez %>% goana.default -> GOtbl
 
-GOtbl$tbl[,-1] %>% topGO %>% kbl %>%
+GOtbl$tbl[,-1] %>% as.data.frame %>% topGO %>% kbl %>%
   kable_paper("hover") %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"),fixed_thead = T) %>%
   scroll_box(width = "100%", height = "500px")
@@ -386,7 +386,7 @@ KGtbl %>% topKEGG %>% kbl %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"),fixed_thead = T) %>%
   scroll_box(width = "100%", height = "500px")
 
-GOtbl.top <- GOtbl$tbl[,-1] %>% topGO
+GOtbl.top <- GOtbl$tbl[,-1] %>% as.data.frame %>% topGO
 GOtbl.top <- inner_join(GOtbl.top, GOtbl$tbl)
 names(GOtbl$gns)[2] <- "GOID"
 
